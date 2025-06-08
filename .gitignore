@@ -1,7 +1,12 @@
 .venv
+.vscode
 
 models
 videos
 images
 datasets
+intro
+VKR*
+docs
 
+yolo*

@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 
 from collections import defaultdict
@@ -17,6 +18,8 @@ from torchvision import datasets, models, transforms
 PATH_TO_PLATE_DETECTOR_MODEL = 'models/license_plate_detector.pt'
 PATH_TO_CAR_CLASSIFICATION_MODEL_WEIGHTS = 'models/car_classifier.pth'
 
+CONF_TRESHOLD = 80
+
 car_models = ['volvo xc70', 'vw teramont'] 
 
 class VehicleProcessor:
@@ -30,8 +33,13 @@ class VehicleProcessor:
             device)  # Your custom trained model
 
         # OCR for plate recognition
-        self._plate_reader = easyocr.Reader(
-            ['en', 'ru'], gpu=torch.cuda.is_available())
+        # self._plate_reader = easyocr.Reader(
+            # ['en', 'ru'], gpu=torch.cuda.is_available())
+        self._ocr = easyocr.Reader(['ru', 'en'], gpu=torch.cuda.is_available())  # Только русский язык
+        
+        # Параметры предобработки
+        self._plate_size = (520, 112)  # Стандартный размер номера для предобработки
+        self._char_whitelist = 'ABEKMHOPCTYXАВЕКМНОРСТУХ0123456789'  # Разрешенные символы
 
         # Vehicle make/model classifier
         self._classifier = self._init_classifier()
@@ -98,9 +106,10 @@ class VehicleProcessor:
             # # Чтение номера (если еще не делали)
             if 'plate' not in vehicle and 'class' in vehicle:
                 vehicle['plates'] = self._detect_plates(vehicle_roi)
-            #     plate_text = self._read_plate(vehicle_roi)
-            #     if plate_text:
-            #         vehicle['plate'] = plate_text   
+                for plate in vehicle['plates']:
+                    plate_text = self._recognize_plate(plate['roi'])
+                    if plate_text:
+                        vehicle['plate'] = plate_text   
             
             # Сохраняем обновленные данные
             self._vehicles_data[track_id] = vehicle
@@ -112,8 +121,8 @@ class VehicleProcessor:
                 'bbox': [x1, y1, x2, y2],
                 'class': vehicle.get('class', ""),
                 # 'class_conf': vehicle.get('class_conf', 0),
-                # 'plate': vehicle.get('plate', '')
-                'plates': vehicle.get('plates', []),
+                'plate': vehicle.get('plate', ''),
+                # 'plates': vehicle.get('plates', []),
                 'plates': [{
                     'plate_bbox': [plate['x1'], plate['y1'], plate['x2'], plate['y2']],
                     # 'plate_text': text
@@ -158,6 +167,83 @@ class VehicleProcessor:
         # except Exception as e:
         #     print(f"OCR Error: {e}")
         #     return None
+                # processed_plate = self._preprocess_plate(plate_roi)
+
+        # processed_plate = self._preprocess_plate(plate_roi)
+
+        plate_text = self._ocr_plate(plate_roi)
+        
+        validated_text = self._validate_russian_plate(plate_text)
+        
+        return validated_text
+
+    def _preprocess_plate(self, plate_roi):
+        """Предобработка изображения номера"""
+        # Конвертация в grayscale
+        gray = cv2.cvtColor(plate_roi, cv2.COLOR_BGR2GRAY)
+        # cv2.imwrite('images/plate_1.jpg', gray)
+        # Увеличение резкости
+        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        sharpened = cv2.filter2D(gray, -1, kernel)
+        # cv2.imwrite('images/plate_2.jpg', sharpened)
+        
+        # Адаптивная бинаризация
+        binary = cv2.adaptiveThreshold(
+            sharpened, 255, 
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY_INV, 11, 2
+        )
+        # cv2.imwrite('images/plate_3.jpg', binary)
+        
+        # # Морфологические операции для удаления шума
+        # kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+        # cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        
+        # cv2.imwrite('images/plate_4.jpg', cleaned)
+
+        # Приведение к стандартному размеру
+        resized = cv2.resize(binary, self._plate_size, interpolation=cv2.INTER_CUBIC)
+        
+        return resized
+    
+    def _ocr_plate(self, plate_image):
+        """Распознавание текста на номере"""
+        # Конвертация обратно в BGR для EasyOCR
+        # plate_bgr = cv2.cvtColor(plate_image, cv2.COLOR_GRAY2BGR)
+        license_plate_crop_gray = cv2.cvtColor(plate_image, cv2.COLOR_BGR2GRAY) 
+        cv2.imwrite('images/plate.jpg', plate_image)
+        # Распознавание с жесткими параметрами
+        results = self._ocr.readtext(
+            license_plate_crop_gray,
+            decoder='beamsearch',  # Для последовательностей
+            beamWidth=10,
+            # batch_size=1,
+            # allowlist=self._char_whitelist,
+            detail=0
+        )
+        
+        results.reverse()
+        return "".join(results) if results else ''
+    
+    def _validate_russian_plate(self, text):
+        """Проверка соответствия российскому стандарту"""
+        if not text:
+            return None
+            
+        # Удаляем все пробелы и неразрешенные символы
+        cleaned = ''.join(c for c in text.upper() if c in self._char_whitelist)
+        
+        # Проверяем основные форматы:
+        # Х999ХХ99 или Х999ХХ999
+        if len(cleaned) > 7 and len(cleaned) < 10:
+            # Проверяем формат буква+3 цифры+2 буквы+2-3 цифры
+            pattern = (
+                r'^[ABEKMHOPCTYXАВЕКМНОРСТУХ]{1}\d{3}[ABEKMHOPCTYXАВЕКМНОРСТУХ]{2}\d{2,3}$'
+            )
+            if re.match(pattern, cleaned):
+                # Форматируем номер с пробелами: Х 999 ХХ 99
+                return f"{cleaned[0]} {cleaned[1:4]} {cleaned[4:6]} {cleaned[6:]}"
+                
         return None
 
     def _classify_vehicle(self, vehicle_roi):
@@ -172,7 +258,7 @@ class VehicleProcessor:
                 probabilities = torch.nn.functional.softmax(outputs, dim=1)[0] * 100
                 _, preds = torch.max(outputs, 1)
                 pred = preds[0]
-                if probabilities.cpu().detach().numpy()[pred] > 90:
+                if probabilities.cpu().detach().numpy()[pred] > CONF_TRESHOLD:
                     return car_models[pred], True  
 
             return "Unknown", False
@@ -181,19 +267,6 @@ class VehicleProcessor:
             print(f"Classification Error: {e}")
             return "Unknown", False
 
-    def _extract_detections(self, results, target_class=2):
-        """Convert YOLO results to standardized format"""
-        detections = []
-
-        for box in results.boxes:
-            if int(box.cls) == target_class and box.conf > 0.5:  # Confidence threshold
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                detections.append({
-                    'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                    'confidence': float(box.conf)
-                })
-
-        return detections
 
 
 # Example Usage
@@ -201,9 +274,15 @@ if __name__ == "__main__":
     processor = VehicleProcessor()
     detection_model = YOLO("yolo11n.pt") 
 
-    video_path = '/home/ezaborshchikov/hse_mc/Masters_tethis/videos/parking_video_1.mp4'
+    img = cv2.imread('/home/ezaborshchikov/hse_mc/Masters_tethis/images/ter_2.png')
+    detections = detection_model.track(img, persist=True, classes=[2])
+
+    results = processor.process_frame(img, detections)
+
+
+    video_path = '/home/ezaborshchikov/hse_mc/Masters_tethis/videos/parking_video_2.mp4'
     # input_path = Path(input_path)
-    output_path = '/home/ezaborshchikov/hse_mc/Masters_tethis/videos/out_parking_video_1.mp4'
+    output_path = '/home/ezaborshchikov/hse_mc/Masters_tethis/videos/out_parking_video_2.mp4'
     # Process video stream
     cap = cv2.VideoCapture(video_path)
 
@@ -237,9 +316,9 @@ if __name__ == "__main__":
                 cv2.rectangle(frame, (px1+x1, py1+y1),
                               (px2+x1, py2+y1), (255, 0, 0), 2)
 
-                # if plate['plate_text']:
-                #     cv2.putText(frame, plate['plate_text'], (px1+x1, py1+y1-10),
-                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+                if vehicle['plate']:
+                    cv2.putText(frame, vehicle['plate'], (px1+x1, py1+y1-10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
                     
 
             color = (0, 255, 0)
